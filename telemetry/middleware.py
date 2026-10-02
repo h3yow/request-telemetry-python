@@ -16,6 +16,24 @@
 4. 依据阈值判定慢请求，并调用 :class:`TelemetryCollector` 原子登记；
 5. 采集总开关关闭时直接透传，零记录、近乎零开销；
 6. 采集自身的任何异常都被隔离，绝不改变业务响应。
+
+耗时归因的计时点（均用 :func:`time.perf_counter` 单调时钟）：
+
+- ``t0``：中间件入口；
+- ``t_business``：下游**首次 receive 返回**（框架拿到请求、准备进入
+  业务处理）的时刻；应用在取请求前就失败时回退为 ``t0``；
+- ``t_response``：首条 ``http.response.start`` 发出的时刻；应用在产出响应
+  首字节前就失败/断开时不存在，此时业务窗口延伸到收尾、响应段为 0；
+- ``t_end``：中间件收尾。
+
+于是::
+
+    queue    = t_business  - t0
+    business = t_response  - t_business   （或 t_end - t_business）
+    response = t_end       - t_response   （异常路径为 0）
+
+三段加上归因残差段与嵌套 span 后，与端到端总耗时严格对账（见
+:mod:`telemetry.attribution`）。
 """
 
 from __future__ import annotations
@@ -77,21 +95,35 @@ class TelemetryMiddleware:
         status_code = 0
         disconnected = False
 
+        # 归因计时点（单调时钟，全部可空）：
+        # - t0：中间件入口；
+        # - t_business：下游首次 receive（框架开始取请求、进入业务）；
+        # - t_response：响应首字节时刻；t_end 在 finally 中取。
+        t0 = time.perf_counter()
+        t_business: float | None = None
+        t_response: float | None = None
+
         async def receive_wrapper() -> Message:
-            nonlocal disconnected
+            nonlocal disconnected, t_business
             message = await receive()
+            if t_business is None:
+                # 首次取请求返回 = 等待阶段结束、业务处理真正开始。
+                # 标记点取 await 之后：await 本身的等待也算"进入业务之前"。
+                t_business = time.perf_counter()
             # 记录客户端断开事实；事件仍原样透传给下游，不改变业务语义。
             if message.get("type") == "http.disconnect":
                 disconnected = True
             return message
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status_code
+            nonlocal status_code, t_response
             if message["type"] == "http.response.start":
                 status_code = int(message.get("status", 0))
+                # 业务处理结束、开始回响应的分界点（只记第一次）。
+                if t_response is None:
+                    t_response = time.perf_counter()
             await send(message)
 
-        started = time.perf_counter()
         outcome: Outcome | None = None
         category: FailureCategory | None = None
         reason = ""
@@ -106,7 +138,25 @@ class TelemetryMiddleware:
             outcome, category, reason = classify_exception(exc)
             raise
         finally:
-            duration_ms = (time.perf_counter() - started) * 1000.0
+            t_end = time.perf_counter()
+            duration_ms = (t_end - t0) * 1000.0
+
+            # 业务起点：下游从未调用 receive（极端失败路径）时回退到入口。
+            t_biz = t_business if t_business is not None else t0
+            if t_response is None:
+                # 没有响应首字节（异常/断开）：业务窗口延伸到收尾，
+                # 响应段为 0，全部耗时仍可对账地落在 queue/business/other。
+                queue_ms = (t_biz - t0) * 1000.0
+                business_ms = (t_end - t_biz) * 1000.0
+                response_ms = 0.0
+            else:
+                queue_ms = (t_biz - t0) * 1000.0
+                business_ms = (t_response - t_biz) * 1000.0
+                response_ms = (t_end - t_response) * 1000.0
+            # 单调时钟下不应为负；钳制仅用于消除极端调度噪声。
+            queue_ms = max(0.0, queue_ms)
+            business_ms = max(0.0, business_ms)
+            response_ms = max(0.0, response_ms)
 
             state = scope.get("state", {})
             state_status = state.get(STATE_STATUS_KEY)
@@ -157,6 +207,9 @@ class TelemetryMiddleware:
                 slow=is_slow,
                 kept=False,
                 spans=tuple(ctx.span_records),
+                queue_ms=queue_ms,
+                business_ms=business_ms,
+                response_ms=response_ms,
             )
             # record() 内部已对异常做隔离，不影响主链路。
             self.collector.record(record)

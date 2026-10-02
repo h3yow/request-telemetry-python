@@ -50,6 +50,18 @@ class RequestRecord:
 
     spans: tuple[SpanRecord, ...] = field(default_factory=tuple)
 
+    queue_ms: float = 0.0
+    """进入业务处理之前的等待：中间件入口 → 下游首次取请求（或派发）。
+
+    由中间件按单调时钟实测；未经中间件计时构造的记录保持 ``0.0``。
+    """
+
+    business_ms: float = 0.0
+    """业务处理窗口总耗时（业务起点 → 应用协程结束，含嵌套调用）。"""
+
+    response_ms: float = 0.0
+    """应用协程结束 → 中间件收尾（响应尾部/清理）的耗时。"""
+
 
 @dataclass(frozen=True)
 class EntryAggregation:

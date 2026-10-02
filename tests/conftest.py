@@ -24,18 +24,32 @@ logger = logging.getLogger("telemetry.tests")
 
 @pytest.fixture
 def collector() -> TelemetryCollector:
+    # 容量上限在共享夹具中调到足够大，保持原有"无界保留"测试语义；
+    # 容量/淘汰边界由专门用例用独立配置覆盖（见 test_capacity.py）。
     coll = TelemetryCollector(
-        TelemetryConfig(enabled=True, sample_rate=1.0, slow_threshold_ms=50.0)
+        TelemetryConfig(
+            enabled=True,
+            sample_rate=1.0,
+            slow_threshold_ms=50.0,
+            window_seconds=300.0,
+            window_max_samples=1_000_000,
+            detail_max_records=1_000_000,
+        )
     )
     return coll
 
 
 @pytest.fixture
 def app(collector: TelemetryCollector) -> FastAPI:
+    # 复用 main.build_app 的装配（含 /__telemetry__/* 观测路由），
+    # 但绑定到夹具采集器，便于断言内部状态。
+    from main import build_telemetry_router
+
     application = FastAPI()
     register_exception_handlers(application)
     application.add_middleware(TelemetryMiddleware, collector=collector)
     application.include_router(demo_router)
+    application.include_router(build_telemetry_router(collector))
     return application
 
 
