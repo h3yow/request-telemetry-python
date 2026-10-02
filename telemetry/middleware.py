@@ -4,7 +4,8 @@
 ----
 1. 为每个 HTTP 请求建立唯一 :class:`~telemetry.context.TraceContext`，
    使得请求处理过程中产生的所有 span 归并到同一 ``trace_id``；
-2. 用 :func:`time.perf_counter` 测量端到端耗时（毫秒）；
+2. 用 :func:`time.perf_counter` 测量端到端耗时（毫秒），并记录业务开始
+   边界，供慢请求三段归因（等待/业务/嵌套）；
 3. 确定终态，优先级：
 
    - 下游协程被取消 / receive 收到 ``http.disconnect``
@@ -23,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from fastapi import FastAPI
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .classification import (
@@ -33,7 +35,7 @@ from .classification import (
 )
 from .collector import TelemetryCollector
 from .config import TelemetryConfig
-from .context import begin_trace, reset_trace
+from .context import begin_trace, mark_business_start, reset_trace
 from .recorder import RequestRecord
 
 # 业务异常处理器可在 scope['state'] 中写入该键，显式传递终态信息。
@@ -44,6 +46,56 @@ STATE_STATUS_KEY = "telemetry_status_code"
 
 # 内部观测/控制端点不纳入业务采集口径，避免自污染。
 EXCLUDED_PATH_PREFIX = "/__telemetry__/"
+
+
+class BusinessStartMiddleware:
+    """标记业务处理真正开始边界的内层 ASGI 中间件。
+
+    调用链顺序（外 -> 内）：:class:`TelemetryMiddleware`（建 trace/计时）
+    -> 本中间件 -> 路由/业务。进入本层即视为框架排队、接收请求体等前置
+    工作完成、即将进入业务，在当前 trace 上打一个一次性时间戳。
+    相比用第一次 receive，该边界不依赖服务器何时拉取事件（uvicorn 对
+    无 body 的 GET 可能根本不调 receive），口径稳定。
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            mark_business_start()
+        await self.app(scope, receive, send)
+
+
+def install_telemetry(app: FastAPI, collector: TelemetryCollector) -> FastAPI:
+    """在 FastAPI 应用上安装业务边界标记与遥测中间件。
+
+    Starlette 按后 add 更靠外的顺序包裹，因此先 add 内层标记、
+    再 add 外层 :class:`TelemetryMiddleware`，最终顺序为
+    Telemetry -> BusinessStart -> 路由。
+    """
+
+    app.add_middleware(BusinessStartMiddleware)
+    app.add_middleware(TelemetryMiddleware, collector=collector)
+    app.state.collector = collector  # type: ignore[attr-defined]
+    return app
+
+
+def build_telemetry_app(
+    app: FastAPI,
+    collector: TelemetryCollector,
+    include_routers: bool = True,
+) -> FastAPI:
+    """测试/装配辅助：异常处理器 + 演示路由 + 遥测一次性装齐。"""
+
+    from app.endpoints import router as demo_router
+    from app.errors import register_exception_handlers
+
+    register_exception_handlers(app)
+    if include_routers:
+        app.include_router(demo_router)
+    install_telemetry(app, collector)
+    return app
 
 
 class TelemetryMiddleware:
@@ -91,7 +143,8 @@ class TelemetryMiddleware:
                 status_code = int(message.get("status", 0))
             await send(message)
 
-        started = time.perf_counter()
+        started_perf = time.perf_counter()
+        started_ms = started_perf * 1000.0
         outcome: Outcome | None = None
         category: FailureCategory | None = None
         reason = ""
@@ -106,7 +159,8 @@ class TelemetryMiddleware:
             outcome, category, reason = classify_exception(exc)
             raise
         finally:
-            duration_ms = (time.perf_counter() - started) * 1000.0
+            ended_perf = time.perf_counter()
+            duration_ms = (ended_perf - started_perf) * 1000.0
 
             state = scope.get("state", {})
             state_status = state.get(STATE_STATUS_KEY)
@@ -144,6 +198,11 @@ class TelemetryMiddleware:
             threshold = self.collector.config.slow_threshold_ms
             is_slow = duration_ms > threshold
 
+            business_started_ms = (
+                ctx.business_started_ms
+                if ctx.business_started_ms is not None
+                else 0.0
+            )
             record = RequestRecord(
                 trace_id=trace_id,
                 entry=entry,
@@ -157,6 +216,8 @@ class TelemetryMiddleware:
                 slow=is_slow,
                 kept=False,
                 spans=tuple(ctx.span_records),
+                started_ms=started_ms,
+                business_started_ms=business_started_ms,
             )
             # record() 内部已对异常做隔离，不影响主链路。
             self.collector.record(record)

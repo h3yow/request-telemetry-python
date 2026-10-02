@@ -17,7 +17,8 @@ from app.endpoints import router as demo_router
 from app.errors import register_exception_handlers
 from telemetry.collector import TelemetryCollector
 from telemetry.config import TelemetryConfig
-from telemetry.middleware import TelemetryMiddleware
+from telemetry.middleware import install_telemetry
+from telemetry.obsapi import register_obs_api
 
 logger = logging.getLogger("telemetry.tests")
 
@@ -25,7 +26,14 @@ logger = logging.getLogger("telemetry.tests")
 @pytest.fixture
 def collector() -> TelemetryCollector:
     coll = TelemetryCollector(
-        TelemetryConfig(enabled=True, sample_rate=1.0, slow_threshold_ms=50.0)
+        TelemetryConfig(
+            enabled=True,
+            sample_rate=1.0,
+            slow_threshold_ms=50.0,
+            # 旧用例不关心淘汰，夹具显式给足容量，保持原"全量明细"语义；
+            # 淘汰边界由 test_retention.py 用独立小容量配置专门覆盖。
+            max_records=1_000_000,
+        )
     )
     return coll
 
@@ -34,8 +42,10 @@ def collector() -> TelemetryCollector:
 def app(collector: TelemetryCollector) -> FastAPI:
     application = FastAPI()
     register_exception_handlers(application)
-    application.add_middleware(TelemetryMiddleware, collector=collector)
     application.include_router(demo_router)
+    # 与生产装配一致：业务开始标记内层 + 遥测采集外层。
+    install_telemetry(application, collector)
+    register_obs_api(application, collector)
     return application
 
 

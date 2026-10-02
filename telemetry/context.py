@@ -48,6 +48,17 @@ class TraceContext:
 
     _span_parents: dict[str, str | None] = field(default_factory=dict)
 
+    business_started_ms: float | None = None
+    """业务处理真正开始的时刻（perf_counter 毫秒）；只标记一次。"""
+
+    def mark_business_start(self, now_ms: float) -> bool:
+        """记录业务开始边界（先到的标记生效），返回是否为首次标记。"""
+
+        if self.business_started_ms is None:
+            self.business_started_ms = float(now_ms)
+            return True
+        return False
+
     def register_span(self, parent_span_id: str | None) -> str:
         """登记一个新 span，返回其全局唯一 id。"""
 
@@ -95,6 +106,19 @@ def reset_trace(token: object) -> None:
         _current.reset(token)  # type: ignore[arg-type]
 
 
+def mark_business_start() -> bool:
+    """标记当前请求的"业务处理真正开始"边界（先到先生效）。
+
+    供框架依赖注入点（如 FastAPI 的全局依赖）在拿到请求后、进入业务逻辑前
+    调用一次。无活动 trace 时稳定返回 ``False``，绝不抛异常。
+    """
+
+    ctx = current_trace()
+    if ctx is None:
+        return False
+    return ctx.mark_business_start(time.perf_counter() * 1000.0)
+
+
 @dataclass
 class _SpanHandle:
     ctx: TraceContext
@@ -140,29 +164,35 @@ def trace_span(
         from .classification import classify_exception
 
         outcome, category, reason = classify_exception(exc)
+        ended = time.perf_counter()
         record = SpanRecord(
             trace_id=ctx.trace_id,
             span_id=span_id,
             parent_span_id=parent,
             name=name,
-            duration_ms=(time.perf_counter() - handle.started) * 1000.0,
+            duration_ms=(ended - handle.started) * 1000.0,
             outcome=outcome,
             failure_category=category,
             reason=reason,
+            started_ms=handle.started * 1000.0,
+            ended_ms=ended * 1000.0,
         )
         handle.record = record  # type: ignore[attr-defined]
         ctx.span_records.append(record)
         raise
     else:
+        ended = time.perf_counter()
         record = SpanRecord(
             trace_id=ctx.trace_id,
             span_id=span_id,
             parent_span_id=parent,
             name=name,
-            duration_ms=(time.perf_counter() - handle.started) * 1000.0,
+            duration_ms=(ended - handle.started) * 1000.0,
             outcome=Outcome.SUCCESS,
             failure_category=FailureCategory.NONE,
             reason="",
+            started_ms=handle.started * 1000.0,
+            ended_ms=ended * 1000.0,
         )
         handle.record = record  # type: ignore[attr-defined]
         ctx.span_records.append(record)

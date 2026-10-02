@@ -29,6 +29,11 @@ class SpanRecord:
     outcome: Outcome
     failure_category: FailureCategory
     reason: str
+    started_ms: float = 0.0
+    """span 起始时刻（采集器单调时钟，毫秒；相对任意固定原点）。0 表示缺失。"""
+
+    ended_ms: float = 0.0
+    """span 结束时刻（同上）；``ended - started`` 与 ``duration_ms`` 同源。"""
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,15 @@ class RequestRecord:
     """该记录是否被采样保留。全量计数不受此字段影响。"""
 
     spans: tuple[SpanRecord, ...] = field(default_factory=tuple)
+
+    started_ms: float = 0.0
+    """请求进入中间件的时刻（单调时钟，毫秒）。"""
+
+    business_started_ms: float = 0.0
+    """业务处理真正开始的时刻（等待结束边界）；0 表示未标记。"""
+
+    recorded_ms: float = 0.0
+    """登记到采集器的时刻；供滑动窗口与时长淘汰使用。0 表示由采集器补打。"""
 
 
 @dataclass(frozen=True)
