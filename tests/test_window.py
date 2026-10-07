@@ -1,4 +1,4 @@
-"""滑动窗口测试：滚动计入/滑出、p50/p95/p99、多入口与容量上限。
+"""滑动窗口测试：滚动计入/滑出、p50/p95/p99、多入口与高流量不丢样本。
 
 所有用例注入确定性的假时钟，判定依据通过日志打印。
 """
@@ -54,7 +54,7 @@ def test_nearest_rank_matches_ceil_definition(n: int, q: float,
 
 def test_quantiles_on_100_uniform_samples() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=10_000.0, max_samples=1000, clock=clock)
+    w = SlidingWindow(window_seconds=10_000.0, clock=clock)
     _seed(w, clock, [float(i) for i in range(1, 101)])
     s = w.stats()["http:GET /"]
     logger.debug("输入 1..100 各 1 条 -> p50=%s p95=%s p99=%s",
@@ -68,7 +68,7 @@ def test_quantiles_on_100_uniform_samples() -> None:
 
 def test_samples_enter_immediately_and_expire_by_time() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=10.0, max_samples=1000, clock=clock)
+    w = SlidingWindow(window_seconds=10.0, clock=clock)
     _seed(w, clock, [10.0, 20.0, 30.0])  # 写入完成于 1001/1002/1003
 
     stats_now = w.stats(now=1005.0)["http:GET /"]
@@ -92,7 +92,7 @@ def test_samples_enter_immediately_and_expire_by_time() -> None:
 
 def test_new_request_visible_before_explicit_eviction() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=10.0, max_samples=1000, clock=clock)
+    w = SlidingWindow(window_seconds=10.0, clock=clock)
     assert w.add("e", clock(), 5.0, False, False) is True
     # 写入后不调用 evict，直接 stats 也必须立刻可见。
     assert w.stats()["e"].count == 1
@@ -101,7 +101,7 @@ def test_new_request_visible_before_explicit_eviction() -> None:
 
 def test_late_sample_older_than_window_is_rejected() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=10.0, max_samples=1000, clock=clock)
+    w = SlidingWindow(window_seconds=10.0, clock=clock)
     clock.advance(100.0)
     accepted = w.add("e", clock() - 11.0, 1.0, False, False)
     logger.debug("迟到样本 ts=now-11s（窗口 10s）-> 保留=%s, size=%s",
@@ -115,7 +115,7 @@ def test_late_sample_older_than_window_is_rejected() -> None:
 
 def test_error_and_slow_counts_match_count_under_mix() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=1000.0, max_samples=1000, clock=clock)
+    w = SlidingWindow(window_seconds=1000.0, clock=clock)
     cases = [
         ("a", 10.0, False, False),
         ("a", 95.0, False, True),
@@ -134,47 +134,43 @@ def test_error_and_slow_counts_match_count_under_mix() -> None:
     assert b.count == 1 and b.error_count == 0 and b.slow_count == 0
 
 
-# ---- 容量上限（FIFO 丢最旧，绝不丢计数语义）----------------------------
+# ---- 高流量不丢样本（窗口无条数上限）-------------------------------------
 
-def test_overflow_drops_oldest_fifo() -> None:
+def test_window_never_drops_samples_under_high_volume() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=1e9, max_samples=3, clock=clock)
-    for dur in (10.0, 20.0, 30.0, 40.0):
-        clock.advance(1.0)
-        w.add("e", clock(), dur, False, False)
-        logger.debug("写入 %s 后 size=%s dropped=%s",
-                     dur, w.size, w.overflow_dropped)
+    w = SlidingWindow(window_seconds=60.0, clock=clock)
+    total = 20_000  # 远超旧实现的默认容量上限 10000
+    for i in range(total):
+        clock.advance(0.001)  # 全部落在 60s 窗口内
+        w.add("e", clock(), float(i % 100), is_error=(i % 7 == 0),
+              is_slow=(i % 5 == 0))
     s = w.stats()["e"]
-    logger.debug("上限 3，写入 4 条 -> count=%s 最小保留耗时=%s",
-                 s.count, s.p50_ms)
-    # 判定依据：FIFO 淘汰最旧（10），保留 20/30/40；added=4 不丢账。
-    assert w.size == 3
-    assert w.overflow_dropped == 1
-    assert w.added == 4
-    assert s.p50_ms == 30.0  # 20,30,40 的 p50
-    assert s.count == 3
+    logger.debug("窗口内写入 %s 条 -> count=%s errors=%s slow=%s added=%s",
+                 total, s.count, s.error_count, s.slow_count, w.added)
+    # 判定依据：窗口不设条数上限，窗口时间内写入多少就统计多少。
+    assert s.count == total
+    assert w.added == total
+    assert w.size == total
+    assert s.error_count == len([i for i in range(total) if i % 7 == 0])
+    assert s.slow_count == len([i for i in range(total) if i % 5 == 0])
 
 
 def test_invalid_construction_arguments_rejected() -> None:
     with pytest.raises(ValueError):
         SlidingWindow(window_seconds=0.0)
-    with pytest.raises(ValueError):
-        SlidingWindow(window_seconds=1.0, max_samples=0)
     with pytest.raises(TypeError):
         SlidingWindow(window_seconds=True)  # type: ignore[arg-type]
-    logger.debug("非法构造参数（0 窗口/0 容量/bool）均被拒绝")
+    logger.debug("非法构造参数（0 窗口/bool）均被拒绝")
 
 
-def test_reconfigure_shrinks_window_and_capacity() -> None:
+def test_reconfigure_shrinks_window() -> None:
     clock = FakeClock()
-    w = SlidingWindow(window_seconds=100.0, max_samples=10, clock=clock)
+    w = SlidingWindow(window_seconds=100.0, clock=clock)
     _seed(w, clock, [1.0, 2.0, 3.0])  # 完成于 1001/1002/1003
-    # 窗口缩到 1s：现在 1003，只剩 ts>=1002... 实际下界 1002，1001 滑出。
-    w.reconfigure(window_seconds=1.0, max_samples=10, now=1003.0)
+    # 窗口缩到 1s：现在 1003，下界 1002，ts=1001 的样本滑出。
+    w.reconfigure(window_seconds=1.0, now=1003.0)
+    logger.debug("热更新: 窗口 100s->1s 过期=%s, size=%s", w.expired, w.size)
     assert w.size == 2 and w.expired == 1
-    # 容量缩到 1：FIFO 再丢 1 条最旧。
-    w.reconfigure(window_seconds=100.0, max_samples=1, now=1003.0)
-    logger.debug("热更新: 窗口缩短过期=%s, 容量收缩丢弃=%s, size=%s",
-                 w.expired, w.overflow_dropped, w.size)
-    assert w.size == 1
-    assert w.overflow_dropped == 1
+    # 扩大窗口不丢样本：现存样本全部保留。
+    w.reconfigure(window_seconds=100.0, now=1003.0)
+    assert w.size == 2 and w.expired == 1

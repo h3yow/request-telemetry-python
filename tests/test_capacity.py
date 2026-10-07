@@ -54,7 +54,7 @@ def bounded_collector() -> tuple[TelemetryCollector, FakeClock]:
     coll = TelemetryCollector(
         TelemetryConfig(
             enabled=True, sample_rate=1.0, slow_threshold_ms=50.0,
-            window_seconds=100.0, window_max_samples=1000,
+            window_seconds=100.0,
             detail_max_records=3, slow_top_n=2,
         ),
         clock=clock,
@@ -116,7 +116,7 @@ def test_shrinking_capacity_via_config_evicts_immediately(
     assert len(coll.snapshot()) == 3
     coll.update_config(
         TelemetryConfig(detail_max_records=1, window_seconds=100.0,
-                        window_max_samples=1000, slow_top_n=2)
+                        slow_top_n=2)
     )
     logger.debug("容量 3->1 热更新后立即淘汰 -> 保留=%s",
                  [r.trace_id for r in coll.snapshot()])
@@ -132,7 +132,7 @@ def test_window_is_full_census_even_at_zero_sample_rate(
     coll, clock = bounded_collector
     coll.update_config(TelemetryConfig(
         sample_rate=0.0, detail_max_records=3, window_seconds=100.0,
-        window_max_samples=1000, slow_top_n=2))
+        slow_top_n=2))
     for i in range(20):
         clock.advance(0.5)
         rec = _rec(
@@ -201,7 +201,7 @@ def test_slowest_attributions_sorted_and_consistent(
     # 该用例要保留全部明细以纯粹验证排序/Top N：放宽到容量 10。
     coll.update_config(TelemetryConfig(
         sample_rate=1.0, slow_threshold_ms=50.0, window_seconds=100.0,
-        window_max_samples=1000, detail_max_records=10, slow_top_n=2))
+        detail_max_records=10, slow_top_n=2))
     spans = (_span_root("db", 40.0),)
     data = [("a", 600.0, True), ("b", 900.0, True), ("c", 300.0, True),
             ("ok", 5.0, False)]
@@ -235,36 +235,58 @@ def test_slowest_attributions_limit_and_entry_filter(
                  [r.trace_id for r, _ in explicit_limit])
     assert [r.trace_id for r, _ in only_b] == ["x2"]
     assert [r.trace_id for r, _ in explicit_limit] == ["x2"]
-    with pytest.raises(ValueError):
-        coll.slowest_attributions(limit=0)
 
 
-def test_window_overflow_does_not_affect_census() -> None:
+def test_slowest_attributions_limit_boundary_values(
+    bounded_collector: tuple[TelemetryCollector, FakeClock]
+) -> None:
+    """limit 边界：0/负数确定地返回空列表，超大值返回全部，均不报错。"""
+
+    coll, clock = bounded_collector
+    for i, dur in enumerate((300.0, 100.0, 200.0)):
+        clock.advance(1.0)
+        coll.record(_rec(f"s-{i}", duration_ms=dur, slow=True))
+
+    empty_zero = coll.slowest_attributions(limit=0)
+    empty_negative = coll.slowest_attributions(limit=-5)
+    huge = coll.slowest_attributions(limit=10**9)
+    logger.debug("limit=0 -> %s 条; limit=-5 -> %s 条; limit=1e9 -> %s 条",
+                 len(empty_zero), len(empty_negative), len(huge))
+    # 判定依据：边界输入都有确定结果，而不是抛错导致观测接口 500。
+    assert empty_zero == []
+    assert empty_negative == []
+    assert [r.trace_id for r, _ in huge] == ["s-0", "s-2", "s-1"]
+    with pytest.raises(TypeError):
+        coll.slowest_attributions(limit=True)  # type: ignore[arg-type]
+
+
+def test_window_matches_census_beyond_former_capacity() -> None:
+    """窗口内请求量超过旧容量上限（10000）时，窗口仍与全量累计一致。"""
+
     clock = FakeClock()
     coll = TelemetryCollector(
         TelemetryConfig(
             enabled=True, sample_rate=0.0, slow_threshold_ms=1e9,
-            window_seconds=1e9, window_max_samples=3,
+            window_seconds=1e9,
             detail_max_records=10, slow_top_n=5,
         ),
         clock=clock,
     )
-    for i in range(6):
-        clock.advance(1.0)
-        coll.record(_rec(f"t-{i}", duration_ms=10.0 * (i + 1)))  # 10..60
+    total = 12_000
+    for i in range(total):
+        clock.advance(0.001)
+        coll.record(_rec(f"t-{i}", duration_ms=10.0 * (i % 10 + 1)))
     window = coll.window_stats()["http:GET /"]
     meta = coll.window_meta()
     census_total = coll.aggregate().census["http:GET /"].total
-    logger.debug("窗口上限 3 写 6 条 -> 窗口count=%s dropped=%s added=%s; "
+    logger.debug("窗口内写入 %s 条 -> 窗口count=%s added=%s expired=%s; "
                  "census=%s（零采样明细=%s）",
-                 window.count, meta["overflow_dropped"], meta["added"],
+                 total, window.count, meta["added"], meta["expired"],
                  census_total, coll.aggregate().total_kept)
-    # 判定依据：窗口 FIFO 丢 3 条最旧样本（只影响窗口口径），
-    # census 仍是全量 6，且零采样下明细为空。
-    assert window.count == 3
-    assert meta["overflow_dropped"] == 3 and meta["added"] == 6
-    assert window.p50_ms == 50.0  # 保留 40/50/60；nearest-rank p50=第2个
-    assert census_total == 6
+    # 判定依据：窗口无条数上限，窗口与 census 同为全量；零采样下明细为空。
+    assert window.count == total
+    assert meta["added"] == total and meta["expired"] == 0
+    assert census_total == total
     assert coll.aggregate().total_kept == 0
 
 

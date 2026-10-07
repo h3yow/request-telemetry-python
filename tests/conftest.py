@@ -24,7 +24,7 @@ logger = logging.getLogger("telemetry.tests")
 
 @pytest.fixture
 def collector() -> TelemetryCollector:
-    # 容量上限在共享夹具中调到足够大，保持原有"无界保留"测试语义；
+    # 明细容量上限在共享夹具中调到足够大，保持原有"无界保留"测试语义；
     # 容量/淘汰边界由专门用例用独立配置覆盖（见 test_capacity.py）。
     coll = TelemetryCollector(
         TelemetryConfig(
@@ -32,7 +32,6 @@ def collector() -> TelemetryCollector:
             sample_rate=1.0,
             slow_threshold_ms=50.0,
             window_seconds=300.0,
-            window_max_samples=1_000_000,
             detail_max_records=1_000_000,
         )
     )

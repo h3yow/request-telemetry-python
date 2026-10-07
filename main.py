@@ -94,7 +94,11 @@ def build_telemetry_router(target: TelemetryCollector) -> APIRouter:
     def telemetry_slow(
         limit: int | None = None, entry: str | None = None
     ) -> JSONResponse:
-        """最慢的一批**已保留**慢请求及其耗时归因（耗时降序）。"""
+        """最慢的一批**已保留**慢请求及其耗时归因（耗时降序）。
+
+        ``limit`` 缺省取 ``slow_top_n``；``limit<=0`` 返回空列表；
+        超大值返回全部候选——边界输入都有确定结果，不会 500。
+        """
 
         pairs = target.slowest_attributions(limit=limit, entry=entry)
 
