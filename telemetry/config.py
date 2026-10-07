@@ -1,4 +1,4 @@
-"""遥测配置：总开关、采样率、慢请求阈值、窗口与明细容量。
+"""遥测配置：总开关、采样率、慢请求阈值、窗口长度与明细容量。
 
 可通过代码构造，也可用 :func:`config_from_env` 从环境变量读取：
 
@@ -6,9 +6,11 @@
 - ``TELEMETRY_SAMPLE_RATE``：``0.0~1.0`` 的普通请求采样率，默认 ``1.0``；
 - ``TELEMETRY_SLOW_THRESHOLD_MS``：慢请求阈值（毫秒），默认 ``500.0``；
 - ``TELEMETRY_WINDOW_SECONDS``：滑动窗口长度（秒），默认 ``300.0``；
-- ``TELEMETRY_WINDOW_MAX_SAMPLES``：窗口轻量样本条数硬上限，默认 ``10000``；
 - ``TELEMETRY_DETAIL_MAX_RECORDS``：保留明细条数硬上限，默认 ``1000``；
 - ``TELEMETRY_SLOW_TOP_N``：慢请求归因查询默认返回条数，默认 ``20``。
+
+滑动窗口**没有**条数容量配置：窗口必须覆盖窗口时间内真实发生的全部
+请求，唯一的淘汰规则是按时间自然滑出（见 :mod:`telemetry.window`）。
 
 非法环境变量一律回退默认值，绝不阻断启动。
 """
@@ -23,7 +25,6 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 # 默认值集中定义，供采集器与环境变量解析共用。
 DEFAULT_WINDOW_SECONDS = 300.0
-DEFAULT_WINDOW_MAX_SAMPLES = 10_000
 DEFAULT_DETAIL_MAX_RECORDS = 1_000
 DEFAULT_SLOW_TOP_N = 20
 
@@ -42,10 +43,7 @@ class TelemetryConfig:
     """超过该耗时（严格大于）即判定为慢请求，慢请求始终保留。"""
 
     window_seconds: float = DEFAULT_WINDOW_SECONDS
-    """滑动窗口长度（秒），必须严格为正。"""
-
-    window_max_samples: int = DEFAULT_WINDOW_MAX_SAMPLES
-    """窗口轻量样本条数硬上限（FIFO 淘汰），必须严格为正。"""
+    """滑动窗口长度（秒），必须严格为正。窗口只按时间淘汰，不设条数上限。"""
 
     detail_max_records: int = DEFAULT_DETAIL_MAX_RECORDS
     """保留明细条数硬上限（FIFO 淘汰），必须严格为正。"""
@@ -70,7 +68,7 @@ class TelemetryConfig:
             or init_self.window_seconds <= 0
         ):
             raise ValueError("window_seconds 必须为正数")
-        for name in ("window_max_samples", "detail_max_records", "slow_top_n"):
+        for name in ("detail_max_records", "slow_top_n"):
             value = getattr(init_self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} 必须为正整数")
@@ -128,9 +126,6 @@ def config_from_env() -> TelemetryConfig:
     )
     if window_seconds <= 0:
         window_seconds = DEFAULT_WINDOW_SECONDS
-    window_max_samples = _parse_positive_int(
-        os.environ.get("TELEMETRY_WINDOW_MAX_SAMPLES"), DEFAULT_WINDOW_MAX_SAMPLES
-    )
     detail_max_records = _parse_positive_int(
         os.environ.get("TELEMETRY_DETAIL_MAX_RECORDS"), DEFAULT_DETAIL_MAX_RECORDS
     )
@@ -147,7 +142,6 @@ def config_from_env() -> TelemetryConfig:
         sample_rate=sample_rate,
         slow_threshold_ms=slow_threshold_ms,
         window_seconds=window_seconds,
-        window_max_samples=window_max_samples,
         detail_max_records=detail_max_records,
         slow_top_n=slow_top_n,
     )

@@ -7,13 +7,15 @@
 本轮在此之上新增"把慢看得更细"的能力：
 
 - **滑动时间窗口**：窗口长度可配置，滚动统计最近一段时间内每个入口的请求量、
-  失败数、慢请求数与耗时分位数（p50/p95/p99）；新请求即刻计入、滑出窗口
-  自然退去；
+  失败数、慢请求数与耗时分位数（p50/p95/p99）；**覆盖窗口时间内真实发生的
+  全部请求**——新请求即刻计入、只有真正滑出窗口的才退去，任何流量下窗口
+  各项数字都与全量累计对得上；
 - **慢请求耗时归因**：把一个慢请求的时间拆成"业务前等待 / 业务处理本身 /
   内部嵌套调用 / 回响应 / 对账残差"几段，并支持查询最慢的一批请求的归因明细，
   各段之和与总耗时严格对得上；
-- **明确的容量与淘汰边界**：明细与窗口样本都有硬上限，超限按 FIFO 确定性
-  淘汰，高峰不撑爆内存、查询不被卡住；淘汰只影响明细/窗口，全量计数不丢不重。
+- **明确的容量与淘汰边界**：保留明细有硬上限，超限按 FIFO 确定性淘汰，高峰
+  不撑爆内存、查询不被卡住；窗口样本不设条数上限、只按时间滑出；淘汰只影响
+  明细口径，全量计数与窗口统计不丢不重。
 
 ## 1. 能力概览
 
@@ -23,9 +25,9 @@
 | 失败归类 | `business`（业务异常/4xx）与 `framework`（未处理异常/5xx）严格分开，另有 `client_disconnect`、`none`、`unknown` |
 | 追踪归并 | 一次请求一个 `trace_id`，嵌套内部调用产生多个 span，全部携带同一 trace；基于 `contextvars`，并发请求互不串扰 |
 | 维度聚合 | 按 **入口 × 结果(outcome) × 失败类别(failure)** 聚合；提供全量与采样两套口径 |
-| 滑动窗口 | 可配置窗口长度，滚动给出每个入口的 count/error/slow 与 p50/p95/p99；**全量口径**，与采样无关 |
+| 滑动窗口 | 可配置窗口长度，滚动给出每个入口的 count/error/slow 与 p50/p95/p99；**全量口径**，覆盖窗口内全部请求，与采样无关、无条数上限 |
 | 耗时归因 | 端到端耗时拆成 queue/business（自身+嵌套调用树）/response/other，各段之和严格等于总耗时；可查最慢 Top N |
-| 容量淘汰 | 明细 `detail_max_records`、窗口样本 `window_max_samples` 双硬上限，超限 FIFO 淘汰，规则确定、可观测 |
+| 容量淘汰 | 明细 `detail_max_records` 硬上限，超限 FIFO 淘汰，规则确定、可观测；窗口只按时间滑出，不设条数上限 |
 | 采样 | 错误请求与慢请求**始终保留**；普通请求按配置概率、以 trace_id 做确定性采样 |
 | 总开关 | 可整体关闭（环境变量或运行期接口），关闭后中间件直接透传 |
 | 容错 | 采集内部异常被隔离，不改变业务响应；trace 上下文缺失时稳定降级为 no-op |
@@ -78,9 +80,13 @@ FNV-1a + fmix64 雪崩混合（纯整数、跨进程一致），所以同一 tra
 - 输出每个入口的 `count / error_count / slow_count` 与 `p50_ms / p95_ms /
   p99_ms`。
 
-**口径：窗口是全量口径。** 窗口样本的写入与采样率、明细保留完全无关——即使
-`sample_rate=0`，窗口里的 count/error/slow/分位数仍覆盖全部请求。窗口滑出
-只影响窗口自身，不影响 census（census 是进程生命周期累计值）。
+**口径：窗口是全量口径，且覆盖窗口时间内真实发生的全部请求。** 窗口样本的
+写入与采样率、明细保留完全无关——即使 `sample_rate=0`，窗口里的
+count/error/slow/分位数仍覆盖全部请求。**窗口不设条数上限**：唯一的淘汰
+规则是按时间自然滑出，因此任何流量下（包括窗口时间内持续涌入上万条请求）
+窗口各项数字都与全量累计严格对得上；内存占用由"窗口长度 × 峰值流量"自然
+约束（样本是几十字节的轻量对象）。窗口滑出只影响窗口自身，不影响 census
+（census 是进程生命周期累计值）。
 
 **分位数定义：nearest-rank**，即升序后取第 `ceil(p*n)` 个（1 基），空窗口
 为 `0.0`。该定义无需近似结构、结果可复算；例如 `n=100` 时 p50/p95/p99
@@ -128,28 +134,40 @@ queue + business_own + 顶层嵌套span之和 + response + other == total
 
 最慢请求查询：`collector.slowest_attributions(limit=None, entry=None)`，
 按耗时降序、同耗时按 trace_id 升序（确定可复现），返回 `(RequestRecord,
-RequestAttribution)`；`limit` 缺省取 `slow_top_n`。
+RequestAttribution)`。`limit` 的合法范围与边界行为（确定结果，绝不抛错）：
+
+- 缺省（`None`）：取配置项 `slow_top_n`（默认 20）；
+- 正整数：返回至多 `limit` 条；超过当前候选总数时返回全部候选（结果天然
+  受明细容量 `detail_max_records` 约束，不会无限增长）；
+- `0` 或负数：返回空列表；
+- 非整数（bool、浮点、字符串等）：按缺省 `slow_top_n` 处理。
+
+观测端点 `GET /__telemetry__/slow?limit=...` 同样遵循上述规则：传 0、负数
+或超大值都返回 HTTP 200 与确定的结果体，绝不会因为一个参数返回 500。
 
 ## 3C. 容量与淘汰规则
 
-| 状态 | 默认上限 | 超限规则 | 淘汰影响范围 |
+| 状态 | 上限 | 超限/淘汰规则 | 淘汰影响范围 |
 | --- | --- | --- | --- |
 | 保留明细 `_records` | `detail_max_records=1000` | FIFO 丢最旧明细（错误/慢请求同样适用，规则不因类别而异） | 只影响 sampled 聚合、`snapshot()` 与慢请求归因查询 |
-| 窗口样本 `_window` | `window_max_samples=10000` | FIFO 丢最旧样本，`overflow_dropped` 计数 | 只影响窗口统计 |
+| 窗口样本 `_window` | **无条数上限** | 只按时间滑出：早于 `now - window_seconds` 的样本惰性淘汰（`expired` 计数） | 只影响窗口统计自身 |
 | 全量计数 census | 无条数上限（按入口维度累计） | 不淘汰 | —— |
 | trace 去重账本 | 保存全部 trace_id | 不淘汰 | 保证重复提交绝不重复计数 |
 
 设计取舍：
 
-1. 正常情况下窗口上限远大于窗口内请求量，淘汰只在极端高峰兜底，避免内存
-   被撑爆；`window_meta()` 暴露 `size/added/expired/overflow_dropped`，
-   `detail_evicted` 暴露明细淘汰数，容量行为可观测、可告警；
+1. 窗口统计必须覆盖窗口时间内真实发生的全部请求，因此**不允许用条数上限
+   截断窗口口径**——旧实现的 `window_max_samples`（默认 10000）会在高流量下
+   FIFO 丢弃最旧样本，导致窗口数字比全量报表少一截，该上限已移除；窗口内存
+   由"窗口长度 × 峰值流量"自然约束。`window_meta()` 暴露
+   `window_seconds/size/added/expired`，`detail_evicted` 暴露明细淘汰数，
+   容量行为可观测、可告警；
 2. **淘汰绝不触碰 census**：明细被 FIFO 淘汰后，该 trace 仍留在去重账本中，
    重复提交既不会重复计数、也不会让旧明细"复活"；
 3. 慢请求归因查询只对当前明细做有界内存排序（工作量 ≤ 明细上限），不会被
    流量峰值卡住；
-4. 热更新配置（`update_config`）会按新窗口长度即时淘汰过期样本、按新容量
-   FIFO 收敛，不丢账。
+4. 热更新配置（`update_config`）会按新窗口长度即时淘汰过期样本、按新明细
+   容量 FIFO 收敛，不丢账。
 
 **开采样 / 关采集时的口径：**
 
@@ -167,8 +185,7 @@ RequestAttribution)`；`limit` 缺省取 `slow_top_n`。
 | `TELEMETRY_ENABLED` | `1` | 总开关，`1/true/yes/on` 开，`0/false/no/off` 关 |
 | `TELEMETRY_SAMPLE_RATE` | `1.0` | 普通请求保留概率，范围 `[0,1]`；不影响错误/慢请求 |
 | `TELEMETRY_SLOW_THRESHOLD_MS` | `500.0` | 慢请求阈值（毫秒），严格大于即判慢 |
-| `TELEMETRY_WINDOW_SECONDS` | `300.0` | 滑动窗口长度（秒），必须为正 |
-| `TELEMETRY_WINDOW_MAX_SAMPLES` | `10000` | 窗口轻量样本条数硬上限（FIFO），正整数 |
+| `TELEMETRY_WINDOW_SECONDS` | `300.0` | 滑动窗口长度（秒），必须为正；窗口只按时间滑出，无条数上限 |
 | `TELEMETRY_DETAIL_MAX_RECORDS` | `1000` | 保留明细条数硬上限（FIFO），正整数 |
 | `TELEMETRY_SLOW_TOP_N` | `20` | 慢请求归因查询默认返回条数，正整数 |
 
@@ -189,9 +206,11 @@ TELEMETRY_WINDOW_SECONDS=60 TELEMETRY_DETAIL_MAX_RECORDS=500 \
 - `GET  /__telemetry__/report`：查看聚合报表（含两套口径、总计数、采样率）
 - `GET  /__telemetry__/window`：当前滑动窗口各入口的
   `count/error_count/slow_count/p50_ms/p95_ms/p99_ms`，并带 `meta`
-  （窗口长度、容量、当前样本数、累计滑出/撞上限丢弃数）
+  （窗口长度、当前样本数、累计写入/滑出数）
 - `GET  /__telemetry__/slow?limit=20&entry=http:GET%20/slow`：最慢的一批
-  **已保留**慢请求及归因明细（每段毫秒数 + 嵌套段树 + `accounted_ms` 对账值）
+  **已保留**慢请求及归因明细（每段毫秒数 + 嵌套段树 + `accounted_ms` 对账值）。
+  `limit` 边界：缺省取 `slow_top_n`；`0`/负数返回空列表；超大值返回全部
+  候选——均为 HTTP 200 的确定结果，不会返回 500
 
 也可在代码中 `collector.enable()` / `collector.disable()` /
 `collector.update_config(TelemetryConfig(...))` / `collector.window_stats()` /
@@ -212,7 +231,7 @@ TELEMETRY_WINDOW_SECONDS=60 TELEMETRY_DETAIL_MAX_RECORDS=500 \
 - **开启采样(rate<1)**：普通请求不构造/保留明细对象，写入更少，开销不高于全量；
   窗口样本与 census 计数仍按全量写入（一个很小的对象）；
 - **查询成本**：窗口查询每次对窗内耗时做一次排序（O(n log n)，n 为窗内样本，
-  受 `window_max_samples` 约束）；慢请求归因查询只对 ≤ `detail_max_records`
+  由"窗口长度 × 峰值流量"自然约束）；慢请求归因查询只对 ≤ `detail_max_records`
   条明细排序，均在锁内完成、有界，不随累计流量增长。
 
 `tests/test_overhead.py` 会实测并在日志中打印三种模式的每请求平均耗时
@@ -250,6 +269,20 @@ curl -s "localhost:8000/__telemetry__/slow?limit=5"  # 最慢 5 条 + 归因明�
 可在响应里核对归因：`attribution.accounted_ms` 必须等于该请求的 `total_ms`
 （差值 ≤ 1e-6ms）；嵌套调用以 `segments[].children` 成树出现，耗时不重复累加。
 
+窗口全量覆盖与慢查询边界可手动验证：
+
+```bash
+# 高流量：连续打一万多次请求后，窗口 count 与报表 census total 严格相等
+for i in $(seq 1 12000); do curl -s localhost:8000/ping > /dev/null; done
+curl -s localhost:8000/__telemetry__/window   # entries["http:GET /ping"].count == 12000
+curl -s localhost:8000/__telemetry__/report   # census["http:GET /ping"].total == 12000
+
+# 慢请求明细接口的 limit 边界：都返回 200 与确定结果，不会 500
+curl -s "localhost:8000/__telemetry__/slow?limit=0"          # items 为空
+curl -s "localhost:8000/__telemetry__/slow?limit=-5"         # items 为空
+curl -s "localhost:8000/__telemetry__/slow?limit=1000000000" # 返回全部候选
+```
+
 客户端中途断开（另一个终端）：
 
 ```bash
@@ -262,7 +295,7 @@ curl -s localhost:8000/__telemetry__/report
 ### 运行测试
 
 ```bash
-uv run python -m pytest                      # 全部 90 个用例
+uv run python -m pytest                      # 全部 95 个用例
 uv run python -m pytest -o log_cli=true -o log_cli_level=DEBUG   # 打印每个用例的输入与判定依据
 ```
 
@@ -278,14 +311,18 @@ uv run python -m pytest -o log_cli=true -o log_cli_level=DEBUG   # 打印每个�
 - `test_disconnect.py`：ASGI 层模拟 `http.disconnect` 与 `CancelledError`；
 - `test_overhead.py`：三种模式吞吐对比与"无外部依赖"验证；
 - `test_window.py`：窗口滚动计入/滑出、nearest-rank 分位数、多入口计数一致、
-  容量 FIFO、迟到样本拒绝、参数热更新（15 例）；
+  两万条写入一条不丢（无条数上限）、迟到样本拒绝、参数热更新（15 例）；
 - `test_attribution.py`：分段和严格等于总耗时、嵌套树结构、断开路径、
   无计时点退化、重叠 span 负残差、断链 span 不丢、扁平口径（7 例）；
 - `test_capacity.py`：明细 FIFO 淘汰边界、淘汰 trace 重复提交不复活/不重计、
   容量热更新、零采样下窗口仍全量、关采集三口径皆空、窗口滚动与 census 对账、
-  窗口撞上限不影响 census、慢请求 Top N 排序/过滤/对账（9 例）；
+  高流量下窗口与 census 严格一致、慢请求 Top N 排序/过滤/对账（9 例）；
 - `test_window_attribution_e2e.py`：经中间件实测三段计时与嵌套归因、HTTP
-  观测端点、8×250 并发下窗口与 census 逐项相等（4 例）。
+  观测端点、8×250 并发下窗口与 census 逐项相等（4 例）；
+- `test_window_reconciliation.py`：默认配置下窗口内 12000 条请求窗口各项
+  （含分位数）与全量累计严格一致、16 线程并发洪峰下窗口与 census 对账、
+  请求滑出窗口自然退去、`/__telemetry__/slow` 在 limit=0/负数/超大值下均
+  返回 200 确定结果（5 例）。
 
 ## 7. 代码结构
 

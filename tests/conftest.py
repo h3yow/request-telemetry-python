@@ -32,7 +32,6 @@ def collector() -> TelemetryCollector:
             sample_rate=1.0,
             slow_threshold_ms=50.0,
             window_seconds=300.0,
-            window_max_samples=1_000_000,
             detail_max_records=1_000_000,
         )
     )

@@ -5,14 +5,14 @@
 - 窗口只保存聚合所需的**轻量样本**：完成时刻（单调时钟秒）、入口、
   端到端耗时（毫秒）、是否失败、是否慢。样本按完成时刻单调排列；
 - 新请求在完成的同一临界区内写入，**立刻**可被下一次查询看到；
-- 早于窗口下界（``now - window_seconds``）的样本在写入与查询时惰性
-  淘汰，自然滑出。保留边界为左闭：``ts >= now - window_seconds``；
 - 窗口是**全量口径**：每个进入采集器的请求都写一份窗口样本，与采样率、
   明细保留完全无关。关闭采集总开关后不写入；
-- 样本条数有硬上限 ``max_samples``：正常情况下它远大于窗口内的请求量；
-  若极端高峰把它撑满，则按 FIFO 丢弃**最旧**样本（确定规则），丢弃条数
-  通过 :attr:`SlidingWindow.overflow_dropped` 可观测，避免内存被撑爆。
-  注意这只影响窗口口径，全量 census 计数不受任何影响。
+- **窗口不设条数上限**：窗口统计必须覆盖窗口时间内真实发生的全部请求，
+  任何流量下窗口各项数字都与全量累计对得上。唯一的淘汰规则是按时间
+  自然滑出——早于窗口下界（``now - window_seconds``）的样本在写入与
+  查询时惰性淘汰。保留边界为左闭：``ts >= now - window_seconds``；
+- 内存上界由"窗口长度 x 峰值流量"自然约束（样本为几十字节的轻量对象），
+  不需要、也不允许用条数上限截断统计口径。
 
 线程安全：本类**自身不加锁**。所有调用（写入与查询）都必须在采集器的
 同一把锁下进行，从而与计数、明细淘汰保持一致的原子视图。
@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import math
-import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
@@ -68,14 +67,12 @@ class SlidingWindow:
     """进程内滑动窗口（锁由外部持有）。
 
     :param window_seconds: 窗口长度（秒），必须严格为正；
-    :param max_samples: 窗口样本条数硬上限，必须严格为正；
     :param clock: 返回单调时间（秒）的可调用对象，便于测试注入。
     """
 
     def __init__(
         self,
         window_seconds: float,
-        max_samples: int = 10_000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(window_seconds, (int, float)) or isinstance(
@@ -84,27 +81,17 @@ class SlidingWindow:
             raise TypeError("window_seconds 必须是数值")
         if window_seconds <= 0:
             raise ValueError("window_seconds 必须严格为正")
-        if not isinstance(max_samples, int) or isinstance(max_samples, bool):
-            raise TypeError("max_samples 必须是 int")
-        if max_samples <= 0:
-            raise ValueError("max_samples 必须严格为正")
         self._window = float(window_seconds)
-        self._max_samples = max_samples
         self._clock = clock
         self._samples: deque[_Sample] = deque()
         self._added = 0
         self._expired = 0
-        self._overflow_dropped = 0
 
     # ---- 属性 -------------------------------------------------------
 
     @property
     def window_seconds(self) -> float:
         return self._window
-
-    @property
-    def max_samples(self) -> int:
-        return self._max_samples
 
     @property
     def size(self) -> int:
@@ -124,12 +111,6 @@ class SlidingWindow:
 
         return self._expired
 
-    @property
-    def overflow_dropped(self) -> int:
-        """因撞上限被 FIFO 丢弃的最旧样本累计数。"""
-
-        return self._overflow_dropped
-
     # ---- 写入 / 淘汰 ------------------------------------------------
 
     def add(
@@ -143,8 +124,8 @@ class SlidingWindow:
         """写入一个完成样本。
 
         返回是否保留在窗口内：样本时刻已在窗口之外（迟到且过期）时返回
-        ``False`` 且不计数；正常写入返回 ``True``。撞容量上限时挤掉最旧
-        样本，新样本仍立即计入。
+        ``False`` 且不计数；正常写入返回 ``True``。窗口不设条数上限，
+        写入即计入，只有随时间滑出窗口才会退去。
         """
 
         cutoff = self._clock() - self._window
@@ -162,12 +143,6 @@ class SlidingWindow:
             )
         )
         self._added += 1
-
-        overflow = len(self._samples) - self._max_samples
-        while overflow > 0:
-            self._samples.popleft()
-            self._overflow_dropped += 1
-            overflow -= 1
         return True
 
     def evict(self, now: float | None = None) -> int:
@@ -219,15 +194,11 @@ class SlidingWindow:
         self._samples.clear()
         self._added = 0
         self._expired = 0
-        self._overflow_dropped = 0
 
-    def reconfigure(
-        self, window_seconds: float, max_samples: int, now: float | None = None
-    ) -> None:
-        """热更新窗口长度与容量：保留现存样本，仅按新边界即时收敛。
+    def reconfigure(self, window_seconds: float, now: float | None = None) -> None:
+        """热更新窗口长度：保留现存样本，仅按新边界即时收敛。
 
-        - 新长度更短时，立刻淘汰落在新窗口之外的旧样本（计入 expired）；
-        - 新容量更小时，按 FIFO 丢弃最旧样本（计入 overflow_dropped）。
+        新长度更短时，立刻淘汰落在新窗口之外的旧样本（计入 expired）。
         """
 
         if (
@@ -236,18 +207,6 @@ class SlidingWindow:
             or window_seconds <= 0
         ):
             raise ValueError("window_seconds 必须为正数")
-        if (
-            not isinstance(max_samples, int)
-            or isinstance(max_samples, bool)
-            or max_samples <= 0
-        ):
-            raise ValueError("max_samples 必须为正整数")
 
         self._window = float(window_seconds)
-        self._max_samples = max_samples
         self.evict(now)
-        overflow = len(self._samples) - self._max_samples
-        while overflow > 0:
-            self._samples.popleft()
-            self._overflow_dropped += 1
-            overflow -= 1

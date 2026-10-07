@@ -16,7 +16,8 @@
 
 - 明细队列上限为 ``config.detail_max_records``，超出时按 FIFO 淘汰最旧
   明细（错误/慢请求也遵循同一上限，淘汰规则不因请求类别而变）；
-- 窗口样本上限为 ``config.window_max_samples``，超出时 FIFO 丢最旧样本；
+- 滚动窗口**不设条数上限**：窗口必须覆盖窗口时间内真实发生的全部请求，
+  任何流量下窗口各项数字都与全量累计对得上，唯一淘汰规则是按时间滑出；
 - 明细被淘汰只影响"保留明细"口径与慢请求归因查询，census 计数与窗口样本
   互不牵连；trace 去重账本保留全部 trace_id（保证重复提交绝不重复计数，
   是"全量计数不丢失/不重复"这条对账承诺的前提）；
@@ -82,7 +83,6 @@ class TelemetryCollector:
         self._clock = clock
         self._window = SlidingWindow(
             self._config.window_seconds,
-            self._config.window_max_samples,
             clock=clock,
         )
         self._total_seen = 0
@@ -107,7 +107,6 @@ class TelemetryCollector:
             self._config = config
             self._window.reconfigure(
                 config.window_seconds,
-                config.window_max_samples,
                 now=self._clock(),
             )
             self._enforce_detail_capacity_locked()
@@ -130,9 +129,6 @@ class TelemetryCollector:
             ),
             window_seconds=overrides.get(  # type: ignore[arg-type]
                 "window_seconds", current.window_seconds
-            ),
-            window_max_samples=overrides.get(  # type: ignore[arg-type]
-                "window_max_samples", current.window_max_samples
             ),
             detail_max_records=overrides.get(  # type: ignore[arg-type]
                 "detail_max_records", current.detail_max_records
@@ -316,11 +312,9 @@ class TelemetryCollector:
         with self._lock:
             return {
                 "window_seconds": self._window.window_seconds,
-                "max_samples": self._window.max_samples,
                 "size": self._window.size,
                 "added": self._window.added,
                 "expired": self._window.expired,
-                "overflow_dropped": self._window.overflow_dropped,
             }
 
     # ---- 读取：慢请求归因 -------------------------------------------
@@ -332,14 +326,19 @@ class TelemetryCollector:
 
         - 排序：耗时降序；耗时相同按 trace_id 升序（结论确定、可复现）；
         - ``limit`` 缺省取 ``config.slow_top_n``；
+        - ``limit`` 边界行为（确定结果，绝不抛错）：``0`` 或负数返回空列表；
+          超过当前候选总数时返回全部候选（结果天然受明细容量约束）；
+          非整数（如 bool、float、字符串）视为非法，按缺省 ``slow_top_n``
+          处理，保证观测接口不因一个参数报错；
         - 仅返回**已保留**的慢请求明细（采样/容量淘汰后的口径，见模块文档）；
         - 全程在锁内做有界排序，明细上限即工作量上限。
         """
 
         with self._lock:
-            top_n = self._config.slow_top_n if limit is None else limit
-            if not isinstance(top_n, int) or top_n <= 0:
-                raise ValueError("limit 必须为正整数")
+            top_n = limit if isinstance(limit, int) and not isinstance(limit, bool) \
+                else self._config.slow_top_n
+            if top_n <= 0:
+                return []
             candidates = [
                 rec
                 for rec in self._records
